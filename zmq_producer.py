@@ -4,6 +4,8 @@ import random
 import sqlite3
 import argparse
 from collections import deque
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
 def current_time():
     return int(time.time())
@@ -60,23 +62,33 @@ def resubmit_task(cursor, task_id):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('database')
-    parser.add_argument('timelimit_min', type=float)
+    parser.add_argument('open_time_min', type=float)
+    parser.add_argument('maxtimelimit', type=float)
+    parser.add_argument('address')
     args = parser.parse_args()
-    timelimit_min = args.timelimit_min
-    timelimit_sec = 60 * args.timelimit_min
+    timelimit_min = args.open_time_min
+    timelimit_sec = 60 * timelimit_min
     start_time = time.time()
     finish_time = start_time + timelimit_sec
+    die_time = start_time + 60 * args.maxtimelimit
 
     context = zmq.Context()
     producer = context.socket(zmq.REP)
-    producer.bind('tcp://*:52837')
+    producer.setsockopt(zmq.RCVTIMEO, 10000)
+    producer.bind(args.address)
     print('bound')
     cache = deque()
     with sqlite3.connect(args.database, isolation_level=None) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         while True:
-            request = producer.recv()
+            try:
+                request = producer.recv()
+            except:
+                if time.time() > die_time:
+                    break
+                else:
+                    continue
             worker_done = request[-4:] == b'DONE'
             if worker_done:
                 finished_id = int(request[:-4])
@@ -92,9 +104,14 @@ if __name__ == '__main__':
             if worker_done or time.time() > finish_time:
                 producer.send_multipart([b'0', b'DONE'])
             else:
-                if len(cache) < 10:
-                    new_tasks = next_task(cursor, 100)
-                    cache.extend(new_tasks)
+                if len(cache) < 5:
+                    start_time = time.time()
+                    logging.debug("%s entering next_task", args.address)
+                    new_tasks = next_task(cursor, 10)
+                    logging.debug("%s finished next_task in %.03f",
+                            args.address, time.time() - start_time)
+                    if new_tasks is not None:
+                        cache.extend(new_tasks)
                     if len(cache) > 0:
                         task = cache.popleft()
                     else:
@@ -111,3 +128,5 @@ if __name__ == '__main__':
                 # Return remaining cache items to database
                 for task in cache:
                     resubmit_task(cursor, task['TaskID'])
+            if time.time() > die_time:
+                break
