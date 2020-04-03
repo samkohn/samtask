@@ -3,11 +3,12 @@ import time
 import random
 import sqlite3
 import argparse
+from collections import deque
 
 def current_time():
     return int(time.time())
 
-def next_task(cursor):
+def next_task(cursor, ntasks):
     try:
         cursor.execute('BEGIN EXCLUSIVE TRANSACTION')
         cursor.execute('''SELECT TaskID, Command, Status
@@ -19,19 +20,21 @@ def next_task(cursor):
                 FROM tasks JOIN history USING (TaskID)
             )
             WHERE rn = 1 AND Status = "not started"
-            ORDER BY TaskID''')
-        row = cursor.fetchone()
-        if row is None:
+            LIMIT ?''', (ntasks,))
+        rows = cursor.fetchall()
+        print(len(rows))
+        if len(rows) == 0:
             cursor.execute('COMMIT')
             conn.commit()
             return None
         else:
-            cursor.execute('''INSERT INTO history
-                VALUES (?, "started", ?)''',
-                (row['TaskID'], current_time()))
+            for row in rows:
+                cursor.execute('''INSERT INTO history
+                    VALUES (?, "started", ?)''',
+                    (row['TaskID'], current_time()))
             cursor.execute('COMMIT')
             conn.commit()
-            return row
+            return rows
     except sqlite3.Error:
         conn.commit()
         return None
@@ -45,6 +48,12 @@ def finish_task(cursor, task_id):
 def error_task(cursor, task_id):
     cursor.execute('''INSERT INTO history
         VALUES (?, "error", ?)''',
+        (task_id, current_time()))
+    conn.commit()
+
+def resubmit_task(cursor, task_id):
+    cursor.execute('''INSERT INTO history
+        VALUES (?, "not started", ?)''',
         (task_id, current_time()))
     conn.commit()
 
@@ -62,6 +71,7 @@ if __name__ == '__main__':
     producer = context.socket(zmq.REP)
     producer.bind('tcp://*:52837')
     print('bound')
+    cache = deque()
     with sqlite3.connect(args.database, isolation_level=None) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -82,10 +92,22 @@ if __name__ == '__main__':
             if worker_done or time.time() > finish_time:
                 producer.send_multipart([b'0', b'DONE'])
             else:
-                task = next_task(cursor)
+                if len(cache) < 10:
+                    new_tasks = next_task(cursor, 100)
+                    cache.extend(new_tasks)
+                    if len(cache) > 0:
+                        task = cache.popleft()
+                    else:
+                        task = None
+                else:
+                    task = cache.popleft()
                 if task is None:
                     producer.send_multipart([b'0', b'DONE'])
                 else:
                     producer.send_multipart([b'%d' % task['TaskID'],
                         task['Command'].encode()])
                 print('sent job command')
+            if time.time() > finish_time:
+                # Return remaining cache items to database
+                for task in cache:
+                    resubmit_task(cursor, task['TaskID'])
