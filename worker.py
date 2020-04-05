@@ -6,11 +6,13 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('address')
 parser.add_argument('--outdir')
-parser.add_argument('--max-tasks', type=int)
+parser.add_argument('--max-tasks', type=int, default=-1)
 args = parser.parse_args()
 
 if args.outdir is not None:
     os.chdir(args.outdir)
+
+forever = args.max_tasks < 0
 
 context = zmq.Context()
 worker = context.socket(zmq.REQ)
@@ -21,7 +23,7 @@ print('connected')
 ntasks_recv = 0
 task_id = 0
 try:
-    while ntasks_recv < args.max_tasks:
+    while forever or ntasks_recv < args.max_tasks:
         worker.send(str(task_id).encode())
         print('sent command')
         task_id, line = worker.recv_multipart()
