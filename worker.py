@@ -8,13 +8,13 @@ parser.add_argument('address')
 parser.add_argument('--outdir')
 parser.add_argument('--max-tasks', type=int)
 args = parser.parse_args()
-outdir = args.outdir
 
-os.chdir(outdir)
+if args.outdir is not None:
+    os.chdir(args.outdir)
 
 context = zmq.Context()
 worker = context.socket(zmq.REQ)
-worker.setsockopt(zmq.RCVTIMEO, 25000)
+worker.setsockopt(zmq.RCVTIMEO, 300000)
 worker.connect(args.address)
 print('connected')
 
