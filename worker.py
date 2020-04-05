@@ -28,6 +28,7 @@ try:
         task_id = int(task_id)
         print('received command')
         if line == b'DONE':
+            print('received DONE')
             break
         ntasks_recv += 1
         print(line)
@@ -38,9 +39,11 @@ try:
                 task_id *= -1
         except:
             task_id *= -1
-    worker.send(str(task_id).encode() + b'DONE')
-    worker.recv()
+    else:  # no-break
+        worker.send(str(task_id).encode() + b'DONE')
+        worker.recv()
 finally:
+    print('closing worker socket')
     worker.close(linger=0)
 
 
