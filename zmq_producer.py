@@ -55,10 +55,18 @@ def next_task(cursor, ntasks):
         return rows
 
 @retry
-def finish_task(cursor, task_id):
+def finish_tasks(cursor, task_ids):
+    if len(task_ids) == 0:
+        return
+    values_statement = ', '.join(['(?, "finished", ?)' for _ in task_ids])
+    timestamp = current_time()
+    substitution = []
+    for task_id in task_ids:
+        substitution.append(task_id)
+        substitution.append(timestamp)
     cursor.execute('''INSERT INTO history
-        VALUES (?, "finished", ?)''',
-        (task_id, current_time()))
+        VALUES ''' + values_statement,
+        tuple(substitution))
     conn.commit()
 
 @retry
@@ -69,10 +77,18 @@ def error_task(cursor, task_id):
     conn.commit()
 
 @retry
-def resubmit_task(cursor, task_id):
+def resubmit_tasks(cursor, task_ids):
+    if len(task_ids) == 0:
+        return
+    values_statement = ', '.join(['(?, "not started", ?)' for _ in task_ids])
+    timestamp = current_time()
+    substitution = []
+    for task_id in task_ids:
+        substitution.append(task_id)
+        substitution.append(timestamp)
     cursor.execute('''INSERT INTO history
-        VALUES (?, "not started", ?)''',
-        (task_id, current_time()))
+        VALUES ''' + values_statement,
+        tuple(substitution))
     conn.commit()
 
 if __name__ == '__main__':
@@ -95,6 +111,7 @@ if __name__ == '__main__':
     producer.bind(args.address)
     print('bound')
     cache = deque()
+    finished_cache = []
     with sqlite3.connect(args.database, isolation_level=None) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -108,14 +125,21 @@ if __name__ == '__main__':
                 finished_id = int(request[:-4])
             else:
                 finished_id = int(request)
-            print('received request')
+            print('received request', request)
             if finished_id < 0:
                 error_task(cursor, -1 * finished_id)
             elif finished_id > 0:
-                finish_task(cursor, finished_id)
+                finished_cache.append(finished_id)
+                if len(finished_cache) > 20:
+                    start_time = time.time()
+                    finish_tasks(cursor, finished_cache)
+                    logging.debug('%s finished finish_task in %.03f', args.address,
+                            time.time() - start_time)
+                    finished_cache = []
             else:
                 pass
             if worker_done or time.time() > finish_time:
+                logging.debug('sending DONE')
                 producer.send_multipart([b'0', b'DONE'])
             else:
                 if len(cache) < 10:
@@ -134,11 +158,14 @@ if __name__ == '__main__':
                     task = cache.popleft()
                 if task is None:
                     producer.send_multipart([b'0', b'DONE'])
+                    logging.debug('sending DONE')
                 else:
+                    logging.debug('sending task')
                     producer.send_multipart([b'%d' % task['TaskID'],
                         task['Command'].encode()])
                 print('sent job command')
             if time.time() > finish_time:
                 # Return remaining cache items to database
-                for task in cache:
-                    resubmit_task(cursor, task['TaskID'])
+                resubmit_tasks(cursor, [task['TaskID'] for task in cache])
+                # Log finished tasks as finished
+                finish_tasks(cursor, finished_cache)
