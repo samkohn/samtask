@@ -10,49 +10,65 @@ logging.basicConfig(level=logging.DEBUG)
 def current_time():
     return int(time.time())
 
+def retry(func):
+    def newfunc(*args, **kwargs):
+        error = None
+        for attempt_number in range(10):
+            try:
+                logging.debug('Calling %s: attempt %d', func, attempt_number)
+                x = func(*args, **kwargs)
+                break
+            except sqlite3.OperationalError as e:
+                time.sleep(30*random.random())
+                error = e
+        else:  # no-break
+            raise error
+        return x
+    return newfunc
+
+@retry
 def next_task(cursor, ntasks):
-    try:
-        cursor.execute('BEGIN EXCLUSIVE TRANSACTION')
-        cursor.execute('''SELECT TaskID, Command, Status
-            FROM (
-                SELECT *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY TaskID
-                    ORDER BY Timestamp DESC) rn
-                FROM tasks JOIN history USING (TaskID)
-            )
-            WHERE rn = 1 AND Status = "not started"
-            LIMIT ?''', (ntasks,))
-        rows = cursor.fetchall()
-        print(len(rows))
-        if len(rows) == 0:
-            cursor.execute('COMMIT')
-            conn.commit()
-            return None
-        else:
-            for row in rows:
-                cursor.execute('''INSERT INTO history
-                    VALUES (?, "started", ?)''',
-                    (row['TaskID'], current_time()))
-            cursor.execute('COMMIT')
-            conn.commit()
-            return rows
-    except sqlite3.Error:
+    cursor.execute('BEGIN EXCLUSIVE TRANSACTION')
+    cursor.execute('''SELECT TaskID, Command, Status
+        FROM (
+            SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY TaskID
+                ORDER BY Timestamp DESC) rn
+            FROM tasks JOIN history USING (TaskID)
+        )
+        WHERE rn = 1 AND Status = "not started"
+        LIMIT ?''', (ntasks,))
+    rows = cursor.fetchall()
+    print(len(rows))
+    if len(rows) == 0:
+        cursor.execute('COMMIT')
         conn.commit()
         return None
+    else:
+        for row in rows:
+            cursor.execute('''INSERT INTO history
+                VALUES (?, "started", ?)''',
+                (row['TaskID'], current_time()))
+        cursor.execute('COMMIT')
+        conn.commit()
+        return rows
 
+@retry
 def finish_task(cursor, task_id):
     cursor.execute('''INSERT INTO history
         VALUES (?, "finished", ?)''',
         (task_id, current_time()))
     conn.commit()
 
+@retry
 def error_task(cursor, task_id):
     cursor.execute('''INSERT INTO history
         VALUES (?, "error", ?)''',
         (task_id, current_time()))
     conn.commit()
 
+@retry
 def resubmit_task(cursor, task_id):
     cursor.execute('''INSERT INTO history
         VALUES (?, "not started", ?)''',
@@ -65,6 +81,7 @@ if __name__ == '__main__':
     parser.add_argument('open_time_min', type=float)
     parser.add_argument('maxtimelimit', type=float)
     parser.add_argument('address')
+    parser.add_argument('--cachesize', type=int, default=100)
     args = parser.parse_args()
     timelimit_min = args.open_time_min
     timelimit_sec = 60 * timelimit_min
@@ -81,14 +98,11 @@ if __name__ == '__main__':
     with sqlite3.connect(args.database, isolation_level=None) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        while True:
+        while time.time() < die_time:
             try:
                 request = producer.recv()
-            except:
-                if time.time() > die_time:
-                    break
-                else:
-                    continue
+            except zmq.error.Again:
+                continue
             worker_done = request[-4:] == b'DONE'
             if worker_done:
                 finished_id = int(request[:-4])
@@ -104,10 +118,10 @@ if __name__ == '__main__':
             if worker_done or time.time() > finish_time:
                 producer.send_multipart([b'0', b'DONE'])
             else:
-                if len(cache) < 5:
+                if len(cache) < 10:
                     start_time = time.time()
                     logging.debug("%s entering next_task", args.address)
-                    new_tasks = next_task(cursor, 10)
+                    new_tasks = next_task(cursor, args.cachesize)
                     logging.debug("%s finished next_task in %.03f",
                             args.address, time.time() - start_time)
                     if new_tasks is not None:
@@ -128,5 +142,3 @@ if __name__ == '__main__':
                 # Return remaining cache items to database
                 for task in cache:
                     resubmit_task(cursor, task['TaskID'])
-            if time.time() > die_time:
-                break
