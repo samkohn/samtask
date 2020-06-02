@@ -112,60 +112,68 @@ if __name__ == '__main__':
     print('bound')
     cache = deque()
     finished_cache = []
+    db_is_done = False
     with sqlite3.connect(args.database, isolation_level=None) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        while time.time() < die_time:
-            try:
-                request = producer.recv()
-            except zmq.error.Again:
-                continue
-            worker_done = request[-4:] == b'DONE'
-            if worker_done:
-                finished_id = int(request[:-4])
-            else:
-                finished_id = int(request)
-            print('received request', request)
-            if finished_id < 0:
-                error_task(cursor, -1 * finished_id)
-            elif finished_id > 0:
-                finished_cache.append(finished_id)
-                if len(finished_cache) > 20:
-                    start_time = time.time()
-                    finish_tasks(cursor, finished_cache)
-                    logging.debug('%s finished finish_task in %.03f', args.address,
-                            time.time() - start_time)
-                    finished_cache = []
-            else:
-                pass
-            if worker_done or time.time() > finish_time:
-                logging.debug('sending DONE')
-                producer.send_multipart([b'0', b'DONE'])
-            else:
-                if len(cache) < 10:
-                    start_time = time.time()
-                    logging.debug("%s entering next_task", args.address)
-                    new_tasks = next_task(cursor, args.cachesize)
-                    logging.debug("%s finished next_task in %.03f",
-                            args.address, time.time() - start_time)
-                    if new_tasks is not None:
-                        cache.extend(new_tasks)
-                    if len(cache) > 0:
-                        task = cache.popleft()
-                    else:
-                        task = None
+        try:
+            while time.time() < die_time:
+                try:
+                    request = producer.recv()
+                except zmq.error.Again:
+                    continue
+                worker_done = request[-4:] == b'DONE'
+                if worker_done:
+                    finished_id = int(request[:-4])
                 else:
-                    task = cache.popleft()
-                if task is None:
-                    producer.send_multipart([b'0', b'DONE'])
+                    finished_id = int(request)
+                print('received request', request)
+                if finished_id < 0:
+                    error_task(cursor, -1 * finished_id)
+                elif finished_id > 0:
+                    finished_cache.append(finished_id)
+                    if len(finished_cache) > args.cachesize:
+                        start_time = time.time()
+                        finish_tasks(cursor, finished_cache)
+                        logging.debug('%s finished finish_task in %.03f', args.address,
+                                time.time() - start_time)
+                        finished_cache = []
+                else:
+                    pass
+                if worker_done or time.time() > finish_time:
                     logging.debug('sending DONE')
+                    producer.send_multipart([b'0', b'DONE'])
                 else:
-                    logging.debug('sending task')
-                    producer.send_multipart([b'%d' % task['TaskID'],
-                        task['Command'].encode()])
-                print('sent job command')
-            if time.time() > finish_time:
-                # Return remaining cache items to database
-                resubmit_tasks(cursor, [task['TaskID'] for task in cache])
-                # Log finished tasks as finished
-                finish_tasks(cursor, finished_cache)
+                    if len(cache) < 10:
+                        if not db_is_done:
+                            start_time = time.time()
+                            logging.debug("%s entering next_task", args.address)
+                            new_tasks = next_task(cursor, args.cachesize)
+                            logging.debug("%s finished next_task in %.03f",
+                                    args.address, time.time() - start_time)
+                            if new_tasks is not None:
+                                cache.extend(new_tasks)
+                            else:
+                                db_is_done = True
+                        if len(cache) > 0:
+                            task = cache.popleft()
+                        else:
+                            task = None
+                    else:
+                        task = cache.popleft()
+                    if task is None:
+                        producer.send_multipart([b'0', b'DONE'])
+                        logging.debug('sending DONE')
+                    else:
+                        logging.debug('sending task')
+                        producer.send_multipart([b'%d' % task['TaskID'],
+                            task['Command'].encode()])
+                    print('sent job command')
+                if time.time() > finish_time:
+                    # Return remaining cache items to database
+                    resubmit_tasks(cursor, [task['TaskID'] for task in cache])
+                    # Log finished tasks as finished
+                    finish_tasks(cursor, finished_cache)
+        except KeyboardInterrupt:
+            resubmit_tasks(cursor, [task['TaskID'] for task in cache])
+            finish_tasks(cursor, finished_cache)
